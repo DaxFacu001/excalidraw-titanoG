@@ -4,9 +4,9 @@ import type { FileId } from "@excalidraw/element/types";
 
 import { saveFilesToFirebase } from "../data/firebase";
 
-vi.mock("../data/firebaseSDK", () => {
+vi.mock("../data/supabaseSDK", () => {
   throw new TypeError(
-    "Failed to fetch dynamically imported module: http://localhost/assets/firebaseSDK.js",
+    "Failed to fetch dynamically imported module: http://localhost/assets/supabaseSDK.js",
   );
 });
 
