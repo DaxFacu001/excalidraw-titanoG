@@ -317,9 +317,9 @@ export default defineConfig(({ mode }) => {
             // via a static import from the main bundle, defeating lazy
             // loading. So we exclude it by name instead.
             "**/CodeMirrorEditor-*.js",
-            // lazy-loaded Firebase SDK, only needed for collab/sharing, which
+            // lazy-loaded Supabase SDK, only needed for collab/sharing, which
             // require network anyway
-            "**/firebaseSDK-*.js",
+            "**/supabaseSDK-*.js",
           ],
           // mermaid chunks are excluded here rather than via `globIgnores`
           // as their file names are arbitrary

@@ -1,3 +1,21 @@
+// Supabase-backed implementation of the persistence layer that upstream
+// Excalidraw implements with Firebase (Firestore + Cloud Storage).
+//
+// The file name and the exported function names are intentionally unchanged so
+// that no other module (Collab, App, ExportToExcalidrawPlus, data/index) has to
+// be touched. That keeps this patch small and easy to re-apply on top of newer
+// upstream versions.
+//
+// Storage model:
+// - Collab scenes: table `scenes`, only reachable through the RPC functions
+//   `get_scene` / `save_scene` (see supabase-schema.sql). Concurrency is handled
+//   with optimistic locking on a `rev` counter instead of a Firestore
+//   transaction.
+// - Files (images): public Supabase Storage bucket, upload-only for anon.
+//
+// Everything stored is encrypted client-side with the room key, which lives in
+// the URL fragment and never reaches Supabase.
+
 import { reconcileElements } from "@excalidraw/excalidraw";
 import { MIME_TYPES, toBrandedType } from "@excalidraw/common";
 import { decompressData } from "@excalidraw/excalidraw/data/encode";
@@ -28,23 +46,21 @@ import { getSyncableElements } from ".";
 import type { SyncableExcalidrawElement } from ".";
 import type Portal from "../collab/Portal";
 import type { Socket } from "socket.io-client";
-import type { Bytes } from "firebase/firestore";
-import type { UploadMetadata } from "firebase/storage";
 
 // private
 // -----------------------------------------------------------------------------
 
-let FIREBASE_CONFIG: Record<string, any>;
-try {
-  FIREBASE_CONFIG = JSON.parse(import.meta.env.VITE_APP_FIREBASE_CONFIG);
-} catch (error: any) {
-  console.warn(
-    `Error JSON parsing firebase config. Supplied value: ${
-      import.meta.env.VITE_APP_FIREBASE_CONFIG
-    }`,
-  );
-  FIREBASE_CONFIG = {};
-}
+const SUPABASE_URL = (import.meta.env.VITE_APP_SUPABASE_URL || "").replace(
+  /\/+$/,
+  "",
+);
+const SUPABASE_ANON_KEY = import.meta.env.VITE_APP_SUPABASE_ANON_KEY || "";
+const SUPABASE_BUCKET =
+  import.meta.env.VITE_APP_SUPABASE_BUCKET || "excalidraw-files";
+
+// how many times to re-read, re-reconcile and retry when another client saved
+// the same scene between our read and our write
+const MAX_SAVE_ATTEMPTS = 5;
 
 const lazy = <T>(load: () => Promise<T>) => {
   let promise: Promise<T> | null = null;
@@ -55,63 +71,133 @@ const lazy = <T>(load: () => Promise<T>) => {
     }));
 };
 
-const _initializeFirebase = lazy(async () => {
-  const sdk = await import("./firebaseSDK");
-  return { sdk, app: sdk.initializeApp(FIREBASE_CONFIG) };
+const _loadSupabase = lazy(async () => {
+  // import first so that a failure to load the SDK chunk is what surfaces
+  const { createClient } = await import("./supabaseSDK");
+
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error(
+      "Supabase is not configured. Set VITE_APP_SUPABASE_URL and VITE_APP_SUPABASE_ANON_KEY.",
+    );
+  }
+
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    // no user accounts: the anon key only ever calls the RPC functions and
+    // uploads files
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
 });
 
-const _loadFirestore = lazy(async () => {
-  const { sdk, app } = await _initializeFirebase();
-  const { getFirestore, doc, getDoc, runTransaction, Bytes } = sdk;
-  return { firestore: getFirestore(app), doc, getDoc, runTransaction, Bytes };
-});
+const normalizePath = (path: string) => path.replace(/^\/+/, "");
 
-const _loadStorage = lazy(async () => {
-  const { sdk, app } = await _initializeFirebase();
-  const { getStorage, ref, uploadBytes } = sdk;
-  return { storage: getStorage(app), ref, uploadBytes };
-});
+const isAlreadyExistsError = (error: any) =>
+  String(error?.statusCode) === "409" ||
+  /already exists|duplicate/i.test(String(error?.message ?? ""));
+
+const bytesToBase64 = (bytes: Uint8Array): string => {
+  // chunked to stay clear of the argument limit of String.fromCharCode
+  const CHUNK = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+};
+
+const base64ToBytes = (base64: string): Uint8Array<ArrayBuffer> => {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+};
 
 // -----------------------------------------------------------------------------
+
+type UploadMetadata = {
+  customMetadata?: Record<string, string>;
+};
 
 export const uploadBytesToFirebase = async (
   path: string,
   data: Blob | Uint8Array,
   metadata?: UploadMetadata,
 ) => {
-  const { storage, ref, uploadBytes } = await _loadStorage();
-  return uploadBytes(ref(storage, path), data, metadata);
+  const supabase = await _loadSupabase();
+  const { error } = await supabase.storage
+    .from(SUPABASE_BUCKET)
+    .upload(normalizePath(path), data, {
+      cacheControl: `${FILE_CACHE_MAX_AGE_SEC}`,
+      contentType: MIME_TYPES.binary,
+      upsert: false,
+      metadata: metadata?.customMetadata,
+    });
+  if (error && !isAlreadyExistsError(error)) {
+    throw error;
+  }
 };
 
-type FirebaseStoredScene = {
+type StoredScene = {
+  iv: string; // base64
+  ciphertext: string; // base64
+};
+
+type StoredSceneRow = StoredScene & {
   sceneVersion: number;
-  iv: Bytes;
-  ciphertext: Bytes;
+  rev: number;
 };
 
 const encryptElements = async (
   key: string,
   elements: readonly ExcalidrawElement[],
-): Promise<{ ciphertext: ArrayBuffer; iv: Uint8Array }> => {
+): Promise<StoredScene> => {
   const json = JSON.stringify(elements);
   const encoded = new TextEncoder().encode(json);
   const { encryptedBuffer, iv } = await encryptData(key, encoded);
 
-  return { ciphertext: encryptedBuffer, iv };
+  return {
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(encryptedBuffer)),
+  };
 };
 
 const decryptElements = async (
-  data: FirebaseStoredScene,
+  data: StoredScene,
   roomKey: string,
 ): Promise<readonly ExcalidrawElement[]> => {
-  const ciphertext = data.ciphertext.toUint8Array() as Uint8Array<ArrayBuffer>;
-  const iv = data.iv.toUint8Array() as Uint8Array<ArrayBuffer>;
+  const ciphertext = base64ToBytes(data.ciphertext);
+  const iv = base64ToBytes(data.iv);
 
   const decrypted = await decryptData(iv, ciphertext, roomKey);
   const decodedData = new TextDecoder("utf-8").decode(
     new Uint8Array(decrypted),
   );
   return JSON.parse(decodedData);
+};
+
+const fetchStoredScene = async (
+  roomId: string,
+): Promise<StoredSceneRow | null> => {
+  const supabase = await _loadSupabase();
+  const { data, error } = await supabase.rpc("get_scene", { p_id: roomId });
+  if (error) {
+    throw error;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row) {
+    return null;
+  }
+  return {
+    sceneVersion: row.scene_version,
+    iv: row.iv,
+    ciphertext: row.ciphertext,
+    rev: row.rev,
+  };
 };
 
 class FirebaseSceneVersionCache {
@@ -151,7 +237,8 @@ export const saveFilesToFirebase = async ({
   // failing to load the SDK must fail the whole save rather than be reported
   // per file as `erroredFiles` (which share links ignore, and collab never
   // retries)
-  const { storage, ref, uploadBytes } = await _loadStorage();
+  const supabase = await _loadSupabase();
+  const bucket = supabase.storage.from(SUPABASE_BUCKET);
 
   const erroredFiles: FileId[] = [];
   const savedFiles: FileId[] = [];
@@ -159,10 +246,20 @@ export const saveFilesToFirebase = async ({
   await Promise.all(
     files.map(async ({ id, buffer }) => {
       try {
-        const storageRef = ref(storage, `${prefix}/${id}`);
-        await uploadBytes(storageRef, buffer, {
-          cacheControl: `public, max-age=${FILE_CACHE_MAX_AGE_SEC}`,
-        });
+        const { error } = await bucket.upload(
+          `${normalizePath(prefix)}/${id}`,
+          buffer,
+          {
+            cacheControl: `${FILE_CACHE_MAX_AGE_SEC}`,
+            contentType: MIME_TYPES.binary,
+            upsert: false,
+          },
+        );
+        // file ids are content hashes, so "already exists" means the exact
+        // same file is already stored: treat it as saved
+        if (error && !isAlreadyExistsError(error)) {
+          throw error;
+        }
         savedFiles.push(id);
       } catch (error: any) {
         erroredFiles.push(id);
@@ -171,20 +268,6 @@ export const saveFilesToFirebase = async ({
   );
 
   return { savedFiles, erroredFiles };
-};
-
-const createFirebaseSceneDocument = async (
-  elements: readonly SyncableExcalidrawElement[],
-  roomKey: string,
-) => {
-  const sceneVersion = getSceneVersion(elements);
-  const { ciphertext, iv } = await encryptElements(roomKey, elements);
-  const { Bytes } = await _loadFirestore();
-  return {
-    sceneVersion,
-    ciphertext: Bytes.fromUint8Array(new Uint8Array(ciphertext)),
-    iv: Bytes.fromUint8Array(iv),
-  } as FirebaseStoredScene;
 };
 
 export const saveToFirebase = async (
@@ -203,43 +286,62 @@ export const saveToFirebase = async (
     return null;
   }
 
-  const { firestore, doc, runTransaction } = await _loadFirestore();
-  const docRef = doc(firestore, "scenes", roomId);
+  const supabase = await _loadSupabase();
 
-  const storedScene = await runTransaction(firestore, async (transaction) => {
-    const snapshot = await transaction.get(docRef);
+  let storedScene: StoredScene | null = null;
 
-    if (!snapshot.exists()) {
-      const storedScene = await createFirebaseSceneDocument(elements, roomKey);
+  for (
+    let attempt = 0;
+    attempt < MAX_SAVE_ATTEMPTS && !storedScene;
+    attempt++
+  ) {
+    const prevRow = await fetchStoredScene(roomId);
 
-      transaction.set(docRef, storedScene);
+    let elementsToStore: readonly SyncableExcalidrawElement[] = elements;
 
-      return storedScene;
+    if (prevRow) {
+      const prevStoredElements = getSyncableElements(
+        restoreElements(await decryptElements(prevRow, roomKey), null),
+      );
+      elementsToStore = getSyncableElements(
+        reconcileElements(
+          elements,
+          prevStoredElements as OrderedExcalidrawElement[] as RemoteExcalidrawElement[],
+          appState,
+        ),
+      );
     }
 
-    const prevStoredScene = snapshot.data() as FirebaseStoredScene;
-    const prevStoredElements = getSyncableElements(
-      restoreElements(await decryptElements(prevStoredScene, roomKey), null),
+    const candidate = await encryptElements(roomKey, elementsToStore);
+
+    const { data: newRev, error } = await supabase.rpc("save_scene", {
+      p_id: roomId,
+      p_scene_version: getSceneVersion(elementsToStore),
+      p_iv: candidate.iv,
+      p_ciphertext: candidate.ciphertext,
+      // null = create; otherwise only update if nobody saved in the meantime
+      p_expected_rev: prevRow ? prevRow.rev : null,
+    });
+
+    if (error) {
+      throw error;
+    }
+
+    // null means we lost the race against another client: loop again so we
+    // reconcile against what they stored
+    if (newRev !== null && newRev !== undefined) {
+      storedScene = candidate;
+    }
+  }
+
+  if (!storedScene) {
+    throw new Error(
+      `Could not save scene after ${MAX_SAVE_ATTEMPTS} attempts (too many concurrent updates)`,
     );
-    const reconciledElements = getSyncableElements(
-      reconcileElements(
-        elements,
-        prevStoredElements as OrderedExcalidrawElement[] as RemoteExcalidrawElement[],
-        appState,
-      ),
-    );
+  }
 
-    const storedScene = await createFirebaseSceneDocument(
-      reconciledElements,
-      roomKey,
-    );
-
-    transaction.update(docRef, storedScene);
-
-    // Return the stored elements as the in memory `reconciledElements` could have mutated in the meantime
-    return storedScene;
-  });
-
+  // Return the stored elements as the in memory elements could have mutated in
+  // the meantime
   const storedElements = getSyncableElements(
     restoreElements(await decryptElements(storedScene, roomKey), null),
   );
@@ -254,15 +356,12 @@ export const loadFromFirebase = async (
   roomKey: string,
   socket: Socket | null,
 ): Promise<readonly SyncableExcalidrawElement[] | null> => {
-  const { firestore, doc, getDoc } = await _loadFirestore();
-  const docRef = doc(firestore, "scenes", roomId);
-  const docSnap = await getDoc(docRef);
-  if (!docSnap.exists()) {
+  const row = await fetchStoredScene(roomId);
+  if (!row) {
     return null;
   }
-  const storedScene = docSnap.data() as FirebaseStoredScene;
   const elements = getSyncableElements(
-    restoreElements(await decryptElements(storedScene, roomKey), null, {
+    restoreElements(await decryptElements(row, roomKey), null, {
       deleteInvisibleElements: true,
     }),
   );
@@ -285,10 +384,13 @@ export const loadFilesFromFirebase = async (
   await Promise.all(
     [...new Set(filesIds)].map(async (id) => {
       try {
-        const url = `https://firebasestorage.googleapis.com/v0/b/${
-          FIREBASE_CONFIG.storageBucket
-        }/o/${encodeURIComponent(prefix.replace(/^\//, ""))}%2F${id}`;
-        const response = await fetch(`${url}?alt=media`);
+        const objectPath = `${normalizePath(prefix)}/${id}`
+          .split("/")
+          .map(encodeURIComponent)
+          .join("/");
+        // public bucket: no SDK (and no API key) needed to download
+        const url = `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_BUCKET}/${objectPath}`;
+        const response = await fetch(url);
         if (response.status < 400) {
           const arrayBuffer = await response.arrayBuffer();
 
