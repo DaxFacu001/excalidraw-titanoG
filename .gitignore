@@ -27,3 +27,26 @@ dev-dist
 html
 meta*.json
 .claude
+
+@"
+
+# --- Extras: secretos y archivos de trabajo ---
+.env.*.local
+.dev.vars
+.wrangler/
+*.pem
+*.key
+*.p12
+service-account*.json
+*.patch
+*.excalidraw
+
+@"
+
+# Cualquier .env propio (los del proyecto original siguen versionados)
+.env
+.env.*
+!.env.development
+!.env.production
+!.env.test
+!.env.*.example
